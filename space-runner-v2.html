@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Orbit Dash - Space Runner</title>
+<style>
+  :root {
+    --bg: #0b0a1f;
+    --ink: #f2efff;
+    --muted: #9a95c9;
+    color-scheme: dark;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Trebuchet MS", "Segoe UI", Tahoma, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    -webkit-user-select: none; user-select: none;
+    touch-action: manipulation;
+  }
+  .wrap { width: 100%; max-width: 900px; padding: 8px; }
+  canvas {
+    width: 100%; height: auto; display: block;
+    border-radius: 14px; background: #0b0a1f;
+    box-shadow: 0 0 0 2px #2a2766;
+    touch-action: none;
+  }
+  .help { margin: 10px 4px 0; color: var(--muted); font-size: 14px; text-align: center; line-height: 1.6; }
+  .help b { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="900" height="420" aria-label="Orbit Dash space runner game"></canvas>
+  <p class="help">
+    <b>PC:</b> Space / ↑ = jump (zyada der dabao = ooncha kood), ↓ = slide, P = pause, M = sound on/off<br>
+    <b>Mobile:</b> upar ka hissa tap = jump, neeche ka hissa dabaye rakho = slide, upar-right ka ♪ = sound
+  </p>
+</div>
+
+<script>
+// ===== 1. SETUP =====
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const GROUND = 340;
+
+// ===== 2. ZONES: har zone ka alag grah aur rang =====
+const ZONE_LENGTH = 15000;   // itni distance ke baad naya zone
+const zones = [
+  { name: 'Chand',        top: '#0b0a1f', bot: '#241a63', ground: '#2b2766', edge: '#4a43b0', crater: '#1f1b52', rock: '#6b5f9e', rock2: '#4c4278' },
+  { name: 'Mangal (Mars)', top: '#1a0a10', bot: '#5a1f1f', ground: '#6e2b1f', edge: '#d0654a', crater: '#4f1d16', rock: '#a5503a', rock2: '#7a3226' },
+  { name: 'Barf ka grah',  top: '#06142a', bot: '#14416b', ground: '#2a5f8f', edge: '#8fd3f7', crater: '#1f4a73', rock: '#8fb8d8', rock2: '#5e86a8' },
+  { name: 'Neon Nebula',   top: '#14041f', bot: '#5a1470', ground: '#3b1255', edge: '#ff4fd8', crater: '#2a0c3d', rock: '#9a4fc4', rock2: '#6a2f8c' }
+];
+
+// ===== 3. GAME STATE =====
+let state = 'start';          // 'start' | 'play' | 'pause' | 'over'
+let speed, distance, crystals, score, best = 0;
+let obstacles, gems, items, particles;
+let nextSpawn, shake = 0, flash = 0, banner = 0, zoneIdx = 0;
+let shieldOn = false, magnet = 0, invuln = 0, jumpBuf = 0, overAt = 0;
+let muted = false, slideHeld = false;
+
+try {
+  best = parseInt(localStorage.getItem('orbitDashBest') || '0', 10) || 0;
+  muted = localStorage.getItem('orbitDashMuted') === '1';
+} catch (e) {}
+
+const player = { x: 120, y: GROUND, w: 34, h: 56, vy: 0, onGround: true, sliding: false, step: 0 };
+
+const stars = Array.from({ length: 80 }, () => ({
+  x: Math.random() * W, y: Math.random() * (GROUND - 20),
+  r: Math.random() * 1.6 + 0.4, depth: Math.random() * 0.5 + 0.1
+}));
+const planets = [
+  { x: 650, y: 90,  r: 46, ring: true,  depth: 0.15 },
+  { x: 220, y: 150, r: 22, ring: false, depth: 0.25 }
+];
+
+function resetGame() {
+  speed = 6; distance = 0; crystals = 0; score = 0;
+  obstacles = []; gems = []; items = []; particles = [];
+  nextSpawn = 500; shake = 0; flash = 0; banner = 0; zoneIdx = 0;
+  shieldOn = false; magnet = 0; invuln = 0; jumpBuf = 0;
+  player.y = GROUND; player.vy = 0; player.onGround = true; player.sliding = false;
+}
+resetGame();
+
+// ===== 4. SOUND (browser ki awaaz, koi file nahi chahiye) =====
+let actx = null;
+function audio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (actx && actx.state === 'suspended') actx.resume();
+  return actx;
+}
+function tone(f1, f2, dur, type, vol) {
+  if (muted) return;
+  const a = audio(); if (!a) return;
+  const o = a.createOscillator(), g = a.createGain(), t = a.currentTime;
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(f1, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(f2, 30), t + dur);
+  g.gain.setValueAtTime(vol || 0.05, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(t); o.stop(t + dur);
+}
+const sfx = {
+  jump:   () => tone(300, 620, 0.15, 'square', 0.04),
+  gem:    () => tone(900, 1500, 0.10, 'triangle', 0.07),
+  power:  () => tone(400, 1300, 0.30, 'sawtooth', 0.05),
+  shield: () => tone(700, 150, 0.25, 'square', 0.07),
+  hit:    () => tone(220, 40, 0.55, 'sawtooth', 0.12),
+  zone:   () => { tone(500, 900, 0.35, 'triangle', 0.07); setTimeout(() => tone(700, 1200, 0.35, 'triangle', 0.07), 160); }
+};
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('orbitDashMuted', muted ? '1' : '0'); } catch (e) {}
+}
+
+// ===== 5. CONTROLS =====
+const GRAVITY = 0.75, JUMP_POWER = -15;
+
+function doJump() {
+  player.vy = JUMP_POWER; player.onGround = false; jumpBuf = 0;
+  burst(player.x + 10, GROUND, 6, '#9a95c9');
+  sfx.jump();
+}
+function pressJump() {
+  audio();
+  if (state === 'start') { startGame(); return; }
+  if (state === 'over') { if (performance.now() - overAt > 500) startGame(); return; }
+  if (state === 'pause') { state = 'play'; return; }
+  if (player.onGround) doJump(); else jumpBuf = 8;   // thoda pehle dabaya to landing par kood jayega
+}
+function startGame() { resetGame(); state = 'play'; }
+function togglePause() {
+  if (state === 'play') state = 'pause'; else if (state === 'pause') state = 'play';
+}
+
+window.addEventListener('keydown', (e) => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { e.preventDefault(); if (!e.repeat) pressJump(); }
+  if (['ArrowDown', 'KeyS'].includes(e.code)) { e.preventDefault(); slideHeld = true; }
+  if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
+  if (e.code === 'KeyM') toggleMute();
+});
+window.addEventListener('keyup', (e) => {
+  if (['ArrowDown', 'KeyS'].includes(e.code)) slideHeld = false;
+  // Jump chhodne par chhota hop (variable jump height)
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code) && state === 'play' && player.vy < -7) player.vy = -7;
+});
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  audio();
+  const r = canvas.getBoundingClientRect();
+  const cx = (e.clientX - r.left) / r.width * W;
+  const cy = (e.clientY - r.top) / r.height * H;
+  if (cx > W - 64 && cy < 56) { toggleMute(); return; }
+  if (state !== 'play' || cy < H / 2) pressJump(); else slideHeld = true;
+});
+window.addEventListener('pointerup', () => { slideHeld = false; });
+document.addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') state = 'pause'; });
+
+// ===== 6. SPAWN =====
+function spawn() {
+  const kind = Math.random();
+  if (kind < 0.5) {
+    const h = 34 + Math.random() * 28;
+    obstacles.push({ type: 'rock', x: W + 40, w: 40 + Math.random() * 20, h, y: GROUND - h });
+  } else if (kind < 0.8) {
+    obstacles.push({ type: 'drone', x: W + 40, w: 54, h: 24, y: GROUND - 62 });
+  } else {
+    obstacles.push({ type: 'rock', x: W + 40, w: 36, h: 40, y: GROUND - 40 });
+    obstacles.push({ type: 'rock', x: W + 82, w: 36, h: 52, y: GROUND - 52 });
+  }
+  if (Math.random() < 0.7) {
+    const n = 4, gx = W + 110 + Math.random() * 60, high = Math.random() < 0.5;
+    for (let i = 0; i < n; i++) {
+      const arc = high ? Math.sin(i / (n - 1) * Math.PI) * 70 : 0;
+      gems.push({ x: gx + i * 34, y: GROUND - 32 - arc, got: false });
+    }
+  }
+  // Power-up kabhi kabhi
+  if (Math.random() < 0.14) {
+    items.push({ type: Math.random() < 0.5 ? 'shield' : 'magnet', x: W + 260, y: GROUND - 50 - Math.random() * 50 });
+  }
+  nextSpawn = 330 + Math.random() * 260 + speed * 12;
+}
+
+// ===== 7. PARTICLES =====
+function burst(x, y, n, color) {
+  for (let i = 0; i < n; i++) {
+    particles.push({ x, y, vx: (Math.random() - 0.5) * 5, vy: -Math.random() * 4, life: 28 + Math.random() * 12, color });
+  }
+}
+
+// ===== 8. COLLISION =====
+function playerBox() {
+  const h = player.sliding ? 28 : player.h;
+  return { x: player.x + 5, y: player.y - h + 4, w: player.w - 10, h: h - 6 };
+}
+function hit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ===== 9. UPDATE =====
+function update(dt) {
+  // Particles aur shake hamesha chalte hain (game over ke baad bhi)
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 0.2 * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  if (shake > 0.3) shake *= Math.pow(0.85, dt); else shake = 0;
+  if (flash > 0) flash = Math.max(0, flash - 0.03 * dt);
+  if (banner > 0) banner -= dt;
+
+  if (state !== 'play') return;
+
+  speed = Math.min(6 + distance / 4000, 14);
+  distance += speed * dt;
+  score = Math.floor(distance / 10) + crystals * 10;
+
+  // Zone change
+  const z = Math.floor(distance / ZONE_LENGTH) % zones.length;
+  if (z !== zoneIdx) { zoneIdx = z; banner = 150; flash = 1; sfx.zone(); }
+
+  player.sliding = slideHeld && player.onGround;
+  player.vy += GRAVITY * dt;
+  if (slideHeld && !player.onGround) player.vy += 1.2 * dt;
+  player.y += player.vy * dt;
+  if (player.y >= GROUND) {
+    player.y = GROUND; player.vy = 0;
+    if (!player.onGround) { player.onGround = true; burst(player.x + 17, GROUND, 4, '#9a95c9'); }
+    if (jumpBuf > 0) doJump();
+  }
+  if (jumpBuf > 0) jumpBuf -= dt;
+  player.step += 0.25 * dt * (speed / 6);
+
+  // Thruster ki aag jab hawa mein ho
+  if (!player.onGround && Math.random() < 0.6) {
+    particles.push({ x: player.x - 4, y: player.y - 22, vx: -2 - Math.random() * 2, vy: Math.random() * 1.5, life: 14, color: Math.random() < 0.5 ? '#ffb347' : '#ff7a4d' });
+  }
+
+  if (invuln > 0) invuln -= dt;
+  if (magnet > 0) magnet -= dt;
+
+  nextSpawn -= speed * dt;
+  if (nextSpawn <= 0) spawn();
+
+  const box = playerBox();
+  for (const o of obstacles) {
+    o.x -= speed * dt;
+    const ob = { x: o.x + 4, y: o.y + 4, w: o.w - 8, h: o.h - 6 };
+    if (!o.dead && invuln <= 0 && hit(box, ob)) {
+      if (shieldOn) {
+        // Shield ek takkar rok leta hai
+        shieldOn = false; o.dead = true; invuln = 45; shake = 8;
+        burst(o.x + o.w / 2, o.y + o.h / 2, 18, '#7fe3ff'); sfx.shield();
+      } else { gameOver(); }
+    }
+  }
+  const cxp = player.x + 17, cyp = player.y - 28;
+  for (const g of gems) {
+    // Magnet: crystals khud khinche aate hain
+    if (magnet > 0) {
+      const dx = cxp - g.x, dy = cyp - g.y;
+      if (dx * dx + dy * dy < 240 * 240) { g.x += dx * 0.12 * dt; g.y += dy * 0.12 * dt; }
+    }
+    g.x -= speed * dt;
+    if (!g.got && hit(box, { x: g.x - 10, y: g.y - 10, w: 20, h: 20 })) {
+      g.got = true; crystals++; burst(g.x, g.y, 6, '#ffb347'); sfx.gem();
+    }
+  }
+  for (const it of items) {
+    it.x -= speed * dt;
+    if (!it.got && hit(box, { x: it.x - 16, y: it.y - 16, w: 32, h: 32 })) {
+      it.got = true; sfx.power();
+      if (it.type === 'shield') shieldOn = true; else magnet = 420;
+      burst(it.x, it.y, 14, it.type === 'shield' ? '#7fe3ff' : '#ff5c7a');
+    }
+  }
+  obstacles = obstacles.filter(o => o.x > -100 && !o.dead);
+  gems = gems.filter(g => g.x > -40 && !g.got);
+  items = items.filter(it => it.x > -40 && !it.got);
+
+  for (const s of stars) { s.x -= s.depth * speed * dt; if (s.x < 0) s.x += W; }
+  for (const p of planets) { p.x -= p.depth * speed * dt * 0.5; if (p.x < -120) p.x = W + 120; }
+}
+
+function gameOver() {
+  state = 'over'; shake = 14; overAt = performance.now();
+  burst(player.x + 17, player.y - 28, 26, '#ff5c7a');
+  sfx.hit();
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('orbitDashBest', String(best)); } catch (e) {}
+  }
+}
+
+// ===== 10. DRAW =====
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawBackground() {
+  const z = zones[zoneIdx];
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND);
+  g.addColorStop(0, z.top); g.addColorStop(1, z.bot);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  for (const s of stars) {
+    ctx.globalAlpha = 0.4 + s.depth;
+    ctx.fillStyle = '#fff'; ctx.fillRect(s.x, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+
+  planets.forEach((p, i) => {
+    const c1 = i === 0 ? z.edge : '#ff7a8a';
+    const c2 = i === 0 ? z.bot : z.ground;
+    const pg = ctx.createRadialGradient(p.x - p.r * 0.4, p.y - p.r * 0.4, p.r * 0.2, p.x, p.y, p.r);
+    pg.addColorStop(0, c1); pg.addColorStop(1, c2);
+    if (p.ring) {
+      ctx.strokeStyle = 'rgba(220,210,255,0.4)'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r * 1.7, p.r * 0.4, -0.3, Math.PI, Math.PI * 2); ctx.stroke();
+    }
+    ctx.fillStyle = pg; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    if (p.ring) {
+      ctx.strokeStyle = 'rgba(220,210,255,0.4)'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r * 1.7, p.r * 0.4, -0.3, 0, Math.PI); ctx.stroke();
+    }
+  });
+
+  ctx.fillStyle = z.ground; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = z.edge; ctx.fillRect(0, GROUND, W, 5);
+  ctx.fillStyle = z.crater;
+  const off = distance % 80;
+  for (let x = -off; x < W; x += 80) {
+    ctx.beginPath(); ctx.ellipse(x + 40, GROUND + 38, 22, 7, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawPlayer() {
+  if (invuln > 0 && Math.floor(invuln / 4) % 2) return;     // hit ke baad jhilmilata hai
+  const p = player, x = p.x, y = p.y;
+  if (p.sliding) {
+    ctx.fillStyle = '#e9e6ff'; roundRect(x, y - 24, 44, 22, 9);
+    ctx.fillStyle = '#ffb347'; roundRect(x - 6, y - 22, 10, 16, 4);
+    ctx.fillStyle = '#12103a'; roundRect(x + 30, y - 22, 14, 12, 5);
+  } else {
+    const swing = p.onGround ? Math.sin(p.step * 2) * 9 : 6;
+    ctx.fillStyle = '#b8b3e6'; roundRect(x + 10 + swing, y - 16, 9, 16, 4);
+    ctx.fillStyle = '#ffb347'; roundRect(x - 6, y - 44, 12, 26, 5);
+    ctx.fillStyle = '#e9e6ff'; roundRect(x + 2, y - 42, 28, 30, 9);
+    ctx.fillStyle = '#e9e6ff'; roundRect(x + 14 - swing, y - 16, 10, 16, 4);
+    ctx.beginPath(); ctx.arc(x + 22, y - 48, 14, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#12103a'; roundRect(x + 22, y - 56, 14, 14, 6);
+    ctx.fillStyle = 'rgba(120,200,255,0.8)'; ctx.fillRect(x + 28, y - 53, 4, 4);
+  }
+  if (shieldOn) {
+    const cy = p.sliding ? y - 14 : y - 28;
+    ctx.strokeStyle = 'rgba(127,227,255,0.85)'; ctx.fillStyle = 'rgba(127,227,255,0.12)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(x + 20, cy, 42, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+}
+
+function drawObstacles() {
+  const z = zones[zoneIdx];
+  for (const o of obstacles) {
+    if (o.type === 'rock') {
+      ctx.fillStyle = z.rock;
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y + o.h);
+      ctx.lineTo(o.x + o.w * 0.1, o.y + o.h * 0.35);
+      ctx.lineTo(o.x + o.w * 0.4, o.y);
+      ctx.lineTo(o.x + o.w * 0.8, o.y + o.h * 0.2);
+      ctx.lineTo(o.x + o.w, o.y + o.h);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = z.rock2;
+      ctx.beginPath(); ctx.arc(o.x + o.w * 0.45, o.y + o.h * 0.6, o.w * 0.12, 0, Math.PI * 2); ctx.fill();
+    } else {
+      const bob = Math.sin(distance / 20) * 3;
+      ctx.fillStyle = '#c8c4f0'; roundRect(o.x, o.y + bob, o.w, o.h, 10);
+      ctx.fillStyle = '#3a3580'; ctx.fillRect(o.x + 8, o.y + bob + 8, o.w - 16, 8);
+      ctx.fillStyle = Math.floor(distance / 15) % 2 ? '#ff5c7a' : '#7a2a3d';
+      ctx.beginPath(); ctx.arc(o.x + o.w / 2, o.y + bob + 12, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#c8c4f0'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(o.x + 6, o.y + bob - 4); ctx.lineTo(o.x + o.w - 6, o.y + bob - 4); ctx.stroke();
+    }
+  }
+}
+
+function drawGems() {
+  for (const g of gems) {
+    const pulse = 1 + Math.sin(distance / 12 + g.x) * 0.12;
+    ctx.save(); ctx.translate(g.x, g.y); ctx.scale(pulse, pulse);
+    ctx.fillStyle = '#ffb347';
+    ctx.beginPath(); ctx.moveTo(0, -11); ctx.lineTo(8, 0); ctx.lineTo(0, 11); ctx.lineTo(-8, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ffe2b0';
+    ctx.beginPath(); ctx.moveTo(0, -11); ctx.lineTo(3, -2); ctx.lineTo(-4, 0); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawItems() {
+  for (const it of items) {
+    const bob = Math.sin(distance / 18) * 4;
+    ctx.save(); ctx.translate(it.x, it.y + bob);
+    const col = it.type === 'shield' ? '#7fe3ff' : '#ff5c7a';
+    ctx.fillStyle = 'rgba(11,10,31,0.7)'; ctx.strokeStyle = col; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, 17, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    if (it.type === 'shield') {
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(8, -5); ctx.lineTo(7, 4); ctx.quadraticCurveTo(0, 12, -7, 4); ctx.lineTo(-8, -5); ctx.closePath(); ctx.fill();
+    } else {
+      ctx.lineWidth = 4; ctx.strokeStyle = col; ctx.lineCap = 'butt';
+      ctx.beginPath(); ctx.arc(0, 1, 6, Math.PI, 0, false); ctx.moveTo(-6, 1); ctx.lineTo(-6, 8); ctx.moveTo(6, 1); ctx.lineTo(6, 8); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.fillRect(-8, 6, 4, 3); ctx.fillRect(4, 6, 4, 3);
+    }
+    ctx.restore();
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(p.life / 40, 0);
+    ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#f2efff'; ctx.font = 'bold 22px "Trebuchet MS", sans-serif';
+  ctx.fillText('Score ' + score, 20, 36);
+  ctx.fillStyle = '#ffb347'; ctx.fillText('◆ ' + crystals, 20, 64);
+  if (shieldOn) { ctx.fillStyle = '#7fe3ff'; ctx.font = 'bold 16px "Trebuchet MS", sans-serif'; ctx.fillText('Shield ON', 20, 90); }
+  if (magnet > 0) {
+    ctx.fillStyle = '#ff5c7a'; ctx.font = 'bold 16px "Trebuchet MS", sans-serif'; ctx.fillText('Magnet', 20, shieldOn ? 112 : 90);
+    ctx.fillRect(86, (shieldOn ? 112 : 90) - 10, 70 * (magnet / 420), 8);
+  }
+  ctx.textAlign = 'center'; ctx.fillStyle = '#9a95c9'; ctx.font = '15px "Trebuchet MS", sans-serif';
+  ctx.fillText('Zone ' + (Math.floor(distance / ZONE_LENGTH) + 1) + ': ' + zones[zoneIdx].name, W / 2, 28);
+  ctx.textAlign = 'right'; ctx.font = '16px "Trebuchet MS", sans-serif';
+  ctx.fillText('Best ' + best, W - 70, 34);
+  // Sound icon
+  ctx.font = 'bold 24px "Trebuchet MS", sans-serif'; ctx.fillStyle = muted ? '#6b66a0' : '#f2efff';
+  ctx.fillText('♪', W - 30, 36);
+  if (muted) { ctx.strokeStyle = '#ff5c7a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(W - 48, 38); ctx.lineTo(W - 22, 14); ctx.stroke(); }
+}
+
+function drawBanner() {
+  if (banner <= 0) return;
+  ctx.globalAlpha = Math.min(1, banner / 40);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#f2efff'; ctx.font = 'bold 38px "Trebuchet MS", sans-serif';
+  ctx.fillText('Zone ' + (Math.floor(distance / ZONE_LENGTH) + 1) + ': ' + zones[zoneIdx].name, W / 2, 130);
+  ctx.globalAlpha = 1;
+}
+
+function drawOverlay(title, line1, line2, line3, prompt) {
+  ctx.fillStyle = 'rgba(11,10,31,0.74)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f2efff'; ctx.font = 'bold 54px "Trebuchet MS", sans-serif'; ctx.fillText(title, W / 2, 140);
+  ctx.fillStyle = '#ffb347'; ctx.font = 'bold 24px "Trebuchet MS", sans-serif'; ctx.fillText(line1, W / 2, 190);
+  ctx.fillStyle = '#9a95c9'; ctx.font = '18px "Trebuchet MS", sans-serif';
+  ctx.fillText(line2, W / 2, 228);
+  if (line3) ctx.fillText(line3, W / 2, 256);
+  if (Math.floor(performance.now() / 500) % 2) {
+    ctx.fillStyle = '#f2efff'; ctx.font = 'bold 20px "Trebuchet MS", sans-serif'; ctx.fillText(prompt, W / 2, 318);
+  }
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  drawBackground(); drawGems(); drawItems(); drawObstacles(); drawPlayer(); drawParticles();
+  ctx.restore();
+  if (flash > 0) { ctx.fillStyle = 'rgba(255,255,255,' + (flash * 0.5) + ')'; ctx.fillRect(0, 0, W, H); }
+  drawHUD(); drawBanner();
+
+  if (state === 'start') drawOverlay('ORBIT DASH', 'Space mein daudo, asteroids se bacho',
+    'Shield rok leta hai ek takkar, Magnet crystals kheenchta hai', '4 grah (zone) paar karo aur best score banao', 'Space dabao ya screen tap karo');
+  if (state === 'pause') drawOverlay('PAUSE', 'Game ruka hua hai', 'P dabao ya screen tap karo', '', 'Wapas khelne ke liye tap karo');
+  if (state === 'over') drawOverlay('GAME OVER', 'Score ' + score + '    ◆ ' + crystals,
+    score >= best && score > 0 ? 'Naya best score!' : 'Best ' + best, '', 'Dobara khelne ke liye tap karo');
+}
+
+// ===== 11. GAME LOOP =====
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 16.667, 3);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
